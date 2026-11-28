@@ -420,4 +420,9 @@ class HiSparseConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
         self.connector_scheduler.requests.pop(request.request_id, None)
+        coordinator = self.connector_scheduler.coordinator
+        if coordinator is not None:
+            # Drop a still in-flight host import: nothing will read it once
+            # its receive ACK arrives, so it must not complete.
+            coordinator.finish_host_import(request.request_id, failed=True)
         return False, None

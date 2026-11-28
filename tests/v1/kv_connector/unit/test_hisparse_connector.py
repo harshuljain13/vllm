@@ -566,3 +566,50 @@ def test_residency_updates_persist_by_state_row():
 
     assert table[0, [0, 2]].tolist() == [[4, 5, 0, 0], [1, 0, 3, 6]]
     assert table[1, [0, 2]].tolist() == [[14, 15, 0, 0], [11, 0, 13, 16]]
+
+
+def test_finished_request_drops_pending_host_import():
+    """A finished request's in-flight host import must not complete.
+
+    While an external prefix load is in flight, `request_finished_all_groups`
+    used to only drop the request from the connector's table. The workers'
+    successful receive ACK then ran `complete_host_import` for a request the
+    scheduler had already finished, publishing host pages and planning GPU
+    restores nobody would read.
+    """
+    from tests.v1.core.test_prefix_caching import (
+        HISPARSE_BLOCK_SIZE,
+        make_hisparse_kv_cache_manager,
+        make_request,
+        sha256,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorOutput
+    from vllm.v1.core.kv_cache_utils import init_none_hash
+
+    init_none_hash(sha256)
+
+    manager = make_hisparse_kv_cache_manager(32, host_num_blocks=8)
+    scheduler = HiSparseConnectorScheduler(async_speculative=False)
+    scheduler.bind_coordinator(get_hisparse_coordinator(manager))
+    coordinator = scheduler.coordinator
+    assert coordinator is not None
+
+    connector = object.__new__(HiSparseConnector)
+    connector.connector_scheduler = scheduler
+
+    request = make_request(
+        "req", list(range(2 * HISPARSE_BLOCK_SIZE)), HISPARSE_BLOCK_SIZE, sha256
+    )
+    scheduler.requests[request.request_id] = request
+    coordinator.record_pending_host_import(request.request_id, 2 * HISPARSE_BLOCK_SIZE)
+
+    connector.request_finished_all_groups(request, ())
+
+    # The workers' successful ACK arrives after the finish: the pending
+    # import was dropped, so no state is created and nothing is restored.
+    scheduler.update_connector_output(
+        KVConnectorOutput(finished_recving={request.request_id})
+    )
+
+    assert request.request_id not in coordinator.request_states
+    assert not coordinator.pending_spills
